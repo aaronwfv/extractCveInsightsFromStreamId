@@ -1,0 +1,219 @@
+import requests
+import json
+import time
+from datetime import datetime
+from typing import List, Dict, Set
+
+# Configuration
+API_KEY = "APIKEYHERE"
+STREAM_ID = "STREAMIDHERE"
+BASE_URL = "https://api.feedly.com/v3"
+NEWER_THAN = -86400000  # -1 day in milliseconds
+BATCH_SIZE = 100
+SLEEP_BETWEEN_REQUESTS = 0.5  # Rate limiting delay in seconds
+
+headers = {
+    "accept": "application/json",
+    "content-type": "application/json",
+    "Authorization": f"Bearer {API_KEY}"
+}
+
+
+def fetch_articles_with_continuation(stream_id: str, newer_than: int) -> List[Dict]:
+    """
+    Fetch all articles from a stream using continuation tokens.
+    
+    Args:
+        stream_id: The Feedly stream ID
+        newer_than: Unix timestamp in milliseconds (negative for relative time)
+    
+    Returns:
+        List of all articles fetched
+    """
+    all_articles = []
+    continuation = None
+    page = 1
+    
+    while True:
+        # Build URL with parameters
+        url = f"{BASE_URL}/streams/contents"
+        params = {
+            "streamId": stream_id,
+            "count": 100,
+            "newerThan": newer_than
+        }
+        
+        if continuation:
+            params["continuation"] = continuation
+        
+        print(f"Fetching page {page} of articles...")
+        
+        try:
+            response = requests.get(url, headers=headers, params=params)
+            response.raise_for_status()
+            data = response.json()
+            
+            items = data.get("items", [])
+            all_articles.extend(items)
+            
+            print(f"  Retrieved {len(items)} articles (Total so far: {len(all_articles)})")
+            
+            # Check for continuation token
+            continuation = data.get("continuation")
+            if not continuation:
+                print("No more pages to fetch.")
+                break
+            
+            page += 1
+            time.sleep(SLEEP_BETWEEN_REQUESTS)
+            
+        except requests.exceptions.RequestException as e:
+            print(f"Error fetching articles: {e}")
+            break
+    
+    return all_articles
+
+
+def extract_cve_ids(articles: List[Dict]) -> Set[str]:
+    """
+    Extract unique CVE IDs from articles.
+    
+    Args:
+        articles: List of article objects
+    
+    Returns:
+        Set of unique CVE IDs
+    """
+    cve_ids = set()
+    
+    for article in articles:
+        entities = article.get("entities", [])
+        for entity in entities:
+            # Check if entity is a CVE type
+            entity_id = entity.get("id", "")
+            if entity_id.startswith("vulnerability/m/entity/CVE-"):
+                cve_label = entity.get("label", "")
+                if cve_label.startswith("CVE-"):
+                    cve_ids.add(cve_label)
+    
+    return cve_ids
+
+
+def fetch_cve_insights_batch(cve_ids: List[str]) -> List[Dict]:
+    """
+    Fetch CVE insight cards in batches of up to 100.
+    
+    Args:
+        cve_ids: List of CVE IDs to fetch
+    
+    Returns:
+        List of CVE insight card data
+    """
+    all_cve_data = []
+    
+    # Process in batches
+    for i in range(0, len(cve_ids), BATCH_SIZE):
+        batch = cve_ids[i:i + BATCH_SIZE]
+        print(f"Fetching CVE insights for batch {i//BATCH_SIZE + 1} ({len(batch)} CVEs)...")
+        
+        url = f"{BASE_URL}/entities/.mget"
+        
+        try:
+            response = requests.post(url, json=batch, headers=headers)
+            response.raise_for_status()
+            batch_data = response.json()
+            
+            all_cve_data.extend(batch_data)
+            print(f"  Successfully fetched {len(batch_data)} CVE insight cards")
+            
+            time.sleep(SLEEP_BETWEEN_REQUESTS)
+            
+        except requests.exceptions.RequestException as e:
+            print(f"Error fetching CVE insights for batch: {e}")
+            continue
+    
+    return all_cve_data
+
+
+def save_cve_insights(cve_data: List[Dict], output_dir: str = "cve_insights"):
+    """
+    Save each CVE insight card as a separate JSON file.
+    
+    Args:
+        cve_data: List of CVE insight card objects
+        output_dir: Directory to save JSON files
+    """
+    import os
+    
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+    
+    saved_count = 0
+    for cve in cve_data:
+        cve_label = cve.get("label", "unknown")
+        
+        # Create safe filename
+        filename = f"{cve_label.replace('/', '_')}.json"
+        filepath = os.path.join(output_dir, filename)
+        
+        try:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(cve, f, indent=2, ensure_ascii=False)
+            saved_count += 1
+        except Exception as e:
+            print(f"Error saving {filename}: {e}")
+    
+    print(f"\nSaved {saved_count} CVE insight cards to '{output_dir}/' directory")
+
+
+def main():
+    """Main execution flow."""
+    print("=" * 60)
+    print("Feedly CVE Insight Card Fetcher")
+    print("=" * 60)
+    print(f"Stream ID: {STREAM_ID}")
+    print(f"Time range: Last 24 hours")
+    print()
+    
+    # Step 1: Fetch all articles
+    print("Step 1: Fetching articles from stream...")
+    articles = fetch_articles_with_continuation(STREAM_ID, NEWER_THAN)
+    print(f"\nTotal articles fetched: {len(articles)}")
+    
+    if not articles:
+        print("No articles found. Exiting.")
+        return
+    
+    # Step 2: Extract CVE IDs
+    print("\nStep 2: Extracting CVE IDs from articles...")
+    cve_ids = extract_cve_ids(articles)
+    print(f"Found {len(cve_ids)} unique CVE IDs")
+    
+    if not cve_ids:
+        print("No CVE IDs found in articles. Exiting.")
+        return
+    
+    # Display found CVEs
+    print("\nCVE IDs found:")
+    for cve_id in sorted(cve_ids):
+        print(f"  - {cve_id}")
+    
+    # Step 3: Fetch CVE insight cards
+    print("\nStep 3: Fetching CVE insight cards...")
+    cve_data = fetch_cve_insights_batch(list(cve_ids))
+    
+    if not cve_data:
+        print("No CVE insight data retrieved. Exiting.")
+        return
+    
+    # Step 4: Save CVE insights
+    print("\nStep 4: Saving CVE insight cards...")
+    save_cve_insights(cve_data)
+    
+    print("\n" + "=" * 60)
+    print("Process completed successfully!")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
